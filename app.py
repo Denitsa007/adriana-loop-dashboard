@@ -32,8 +32,16 @@ treatments_df['time'] = pd.to_datetime(treatments_df['created_at'])
 bolus_df = treatments_df[treatments_df['insulin'].notnull()]
 
 # Time filter UI
-start_time = st.datetime_input("Start time", value=entries_df['time'].min())
-end_time = st.datetime_input("End time", value=entries_df['time'].max())
+col1, col2 = st.columns(2)
+with col1:
+    start_date = st.date_input("Start date", value=entries_df['time'].min().date())
+    start_hour = st.time_input("Start time", value=entries_df['time'].min().time())
+with col2:
+    end_date = st.date_input("End date", value=entries_df['time'].max().date())
+    end_hour = st.time_input("End time", value=entries_df['time'].max().time())
+
+start_time = datetime.combine(start_date, start_hour)
+end_time = datetime.combine(end_date, end_hour)
 
 # Filter all data
 entries_df = entries_df[(entries_df['time'] >= start_time) & (entries_df['time'] <= end_time)]
@@ -51,7 +59,7 @@ fig.add_trace(go.Scatter(
     line=dict(color='green')
 ))
 
-# Bolus Bars (manual + SMB combined for now)
+# Bolus Bars (manual + SMB combined)
 fig.add_trace(go.Bar(
     x=bolus_df['time'],
     y=bolus_df['insulin'],
