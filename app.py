@@ -61,11 +61,24 @@ def fetch_nightscout_data(start_date: datetime, end_date: datetime) -> Tuple[pd.
             treatments_df = pd.DataFrame(response["treatments"].json())
             profile = response["profile"].json()[0] if response["profile"].json() else {}
             
-            # Convert timestamps
+            # Convert timestamps with robust column checking
             if not entries_df.empty:
-                entries_df["time"] = pd.to_datetime(entries_df["date"], unit="ms", utc=True)
+                if "date" in entries_df.columns:
+                    entries_df["time"] = pd.to_datetime(entries_df["date"], unit="ms", utc=True)
+                elif "dateString" in entries_df.columns:
+                    entries_df["time"] = pd.to_datetime(entries_df["dateString"], utc=True)
+                else:
+                    st.warning("No timestamp column found in entries data")
+                    entries_df["time"] = pd.to_datetime("now", utc=True)
+
             if not treatments_df.empty:
-                treatments_df["time"] = pd.to_datetime(treatments_df["created_at"], utc=True)
+                if "created_at" in treatments_df.columns:
+                    treatments_df["time"] = pd.to_datetime(treatments_df["created_at"], utc=True)
+                elif "timestamp" in treatments_df.columns:
+                    treatments_df["time"] = pd.to_datetime(treatments_df["timestamp"], unit="ms", utc=True)
+                else:
+                    st.warning("No timestamp column found in treatments data")
+                    treatments_df["time"] = pd.to_datetime("now", utc=True)
             
             return entries_df, treatments_df, profile
             
@@ -158,29 +171,55 @@ def main():
     with st.spinner("Fetching data from Nightscout..."):
         entries_df, treats_df, profile = fetch_nightscout_data(start_dt, end_dt)
     
-    # Filter data to selected time range (redundant but ensures safety)
-    entries_df = entries_df[(entries_df["time"] >= start_dt) & (entries_df["time"] <= end_dt)]
-    treats_df = treats_df[(treats_df["time"] >= start_dt) & (treats_df["time"] <= end_dt)]
+    # Filter data to selected time range with safety checks
+    if not entries_df.empty and "time" in entries_df.columns:
+        entries_df = entries_df[(entries_df["time"] >= start_dt) & (entries_df["time"] <= end_dt)]
+    else:
+        st.warning("No valid time data in entries")
+        entries_df = pd.DataFrame()
+
+    if not treats_df.empty and "time" in treats_df.columns:
+        treats_df = treats_df[(treats_df["time"] >= start_dt) & (treats_df["time"] <= end_dt)]
+    else:
+        st.warning("No valid time data in treatments")
+        treats_df = pd.DataFrame()
     
     # Convert glucose to mmol/L if needed
-    if "sgv" in entries_df.columns:
+    if not entries_df.empty and "sgv" in entries_df.columns:
         entries_df["mmol"] = (entries_df["sgv"] / 18).round(1)
     
-    # Categorize treatments
-    bolus_df = treats_df[treats_df["insulin"].notnull()]
-    smb_df = bolus_df[bolus_df["enteredBy"].str.contains("smb", case=False, na=False)]
-    manual_df = bolus_df[~bolus_df["enteredBy"].str.contains("smb", case=False, na=False)]
-    carb_df = treats_df[treats_df["carbs"].fillna(0) > 0]
-    temp_df = treats_df[treats_df["eventType"] == "Temp Basal"]
+    # Categorize treatments with safety checks
+    bolus_df = pd.DataFrame()
+    smb_df = pd.DataFrame()
+    manual_df = pd.DataFrame()
+    carb_df = pd.DataFrame()
+    temp_df = pd.DataFrame()
+    
+    if not treats_df.empty:
+        if "insulin" in treats_df.columns:
+            bolus_df = treats_df[treats_df["insulin"].notnull()]
+            if "enteredBy" in bolus_df.columns:
+                smb_df = bolus_df[bolus_df["enteredBy"].str.contains("smb", case=False, na=False)]
+                manual_df = bolus_df[~bolus_df["enteredBy"].str.contains("smb", case=False, na=False)]
+        
+        if "carbs" in treats_df.columns:
+            carb_df = treats_df[treats_df["carbs"].fillna(0) > 0]
+        
+        if "eventType" in treats_df.columns:
+            temp_df = treats_df[treats_df["eventType"] == "Temp Basal"]
+    
     basal_sched_df = build_basal_schedule(profile, start_dt, end_dt)
     
     # Calculate dynamic display limits
-    max_bolus = bolus_df["insulin"].max() if not bolus_df.empty else 0
+    max_bolus = bolus_df["insulin"].max() if not bolus_df.empty and "insulin" in bolus_df.columns else 0
     bolus_ylim = max(1, max_bolus * 1.3)  # 30% padding
     
     # ────────── Improved Carb Visualization ──────────
     carb_y_pos = bolus_ylim * 0.9  # Lower position (90% of bolus range)
-    carb_sizes = carb_df["carbs"].fillna(0).apply(lambda g: max(8, min(g * 0.8, 35)))  # Larger bubbles
+    if not carb_df.empty and "carbs" in carb_df.columns:
+        carb_sizes = carb_df["carbs"].fillna(0).apply(lambda g: max(8, min(g * 0.8, 35)))  # Larger bubbles
+    else:
+        carb_sizes = pd.Series([])
     
     # ────────── Visualization ──────────
     fig = make_subplots(
@@ -191,61 +230,65 @@ def main():
     )
     
     # 1. Glucose Trace
-    fig.add_trace(
-        go.Scatter(
-            x=entries_df["time"],
-            y=entries_df["mmol"],
-            mode="lines",
-            line=dict(color="green"),
-            name="BG",
-            hovertemplate="%{y:.1f} mmol/L<br>%{x|%H:%M}"
-        ),
-        row=1, col=1
-    )
+    if not entries_df.empty and "time" in entries_df.columns and "mmol" in entries_df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=entries_df["time"],
+                y=entries_df["mmol"],
+                mode="lines",
+                line=dict(color="green"),
+                name="BG",
+                hovertemplate="%{y:.1f} mmol/L<br>%{x|%H:%M}"
+            ),
+            row=1, col=1
+        )
     
     # 2. Boluses and Carbs (Improved)
-    fig.add_trace(
-        go.Bar(
-            x=manual_df["time"],
-            y=manual_df["insulin"],
-            marker_color="rgba(0,102,204,0.7)",
-            name="Manual bolus"
-        ),
-        row=2, col=1
-    )
-    
-    fig.add_trace(
-        go.Bar(
-            x=smb_df["time"],
-            y=smb_df["insulin"],
-            marker_color="rgba(255,99,132,0.7)",
-            name="SMB"
-        ),
-        row=2, col=1
-    )
-    
-    fig.add_trace(
-        go.Scatter(
-            x=carb_df["time"],
-            y=[carb_y_pos] * len(carb_df),
-            mode="markers+text",
-            marker=dict(
-                color="orange",
-                size=carb_sizes,
-                line=dict(width=1, color="darkorange")  # Border for visibility
+    if not manual_df.empty and "time" in manual_df.columns and "insulin" in manual_df.columns:
+        fig.add_trace(
+            go.Bar(
+                x=manual_df["time"],
+                y=manual_df["insulin"],
+                marker_color="rgba(0,102,204,0.7)",
+                name="Manual bolus"
             ),
-            text=carb_df["carbs"].astype(int).astype(str) + "g",
-            textposition="top center",
-            name="Carbs",
-            hoverinfo="text+x",
-            hovertext=carb_df["carbs"].astype(int).astype(str) + "g carbs<br>" + 
-                      carb_df["time"].dt.strftime("%H:%M")
-        ),
-        row=2, col=1
-    )
+            row=2, col=1
+        )
+    
+    if not smb_df.empty and "time" in smb_df.columns and "insulin" in smb_df.columns:
+        fig.add_trace(
+            go.Bar(
+                x=smb_df["time"],
+                y=smb_df["insulin"],
+                marker_color="rgba(255,99,132,0.7)",
+                name="SMB"
+            ),
+            row=2, col=1
+        )
+    
+    if not carb_df.empty and "time" in carb_df.columns and "carbs" in carb_df.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=carb_df["time"],
+                y=[carb_y_pos] * len(carb_df),
+                mode="markers+text",
+                marker=dict(
+                    color="orange",
+                    size=carb_sizes,
+                    line=dict(width=1, color="darkorange")  # Border for visibility
+                ),
+                text=carb_df["carbs"].astype(int).astype(str) + "g",
+                textposition="top center",
+                name="Carbs",
+                hoverinfo="text+x",
+                hovertext=carb_df["carbs"].astype(int).astype(str) + "g carbs<br>" + 
+                          carb_df["time"].dt.strftime("%H:%M")
+            ),
+            row=2, col=1
+        )
     
     # 3. Basal Rates
-    if not basal_sched_df.empty:
+    if not basal_sched_df.empty and "time" in basal_sched_df.columns and "rate" in basal_sched_df.columns:
         fig.add_trace(
             go.Scatter(
                 x=basal_sched_df["time"],
@@ -258,7 +301,7 @@ def main():
             row=3, col=1
         )
     
-    if not temp_df.empty:
+    if not temp_df.empty and "time" in temp_df.columns and "rate" in temp_df.columns:
         fig.add_trace(
             go.Bar(
                 x=temp_df["time"],
