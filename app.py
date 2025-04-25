@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 
 st.set_page_config(page_title="Adriana Loop Dashboard", layout="wide")
-st.title("Adriana's Looping Dashboard (MVP)")
+st.title("Adriana's Looping Dashboard — Now with Timeline!")
 
 st.markdown("#### Connect to Nightscout and load recent data")
 
