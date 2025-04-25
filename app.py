@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 from datetime import datetime, time
 
 st.set_page_config(page_title="Adriana Loop Dashboard", layout="wide")
-st.title("Adriana's Looping Dashboard — Now with Timeline!")
+st.title("Adriana's Looping Dashboard")
 
 st.markdown("#### Connect to Nightscout and load recent data")
 
@@ -28,7 +28,7 @@ st.success("Data loaded.")
 entries_df['time'] = pd.to_datetime(entries_df['dateString'], errors='coerce')
 entries_df['mmol'] = entries_df['sgv'] / 18.0  # Convert mg/dL to mmol/L
 
-# Remove any invalid datetime rows from entries_df
+# Remove any rows with invalid times
 entries_df = entries_df.dropna(subset=['time'])
 
 treatments_df['time'] = pd.to_datetime(treatments_df['created_at'], errors='coerce')
