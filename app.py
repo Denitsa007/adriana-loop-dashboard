@@ -1,67 +1,83 @@
 # ─────────────────────────────────────────────────────────────────────
-#  Adriana Loop Dashboard – BG + bolus / SMB + carbs + temp-basal
+#  Adriana Loop Dashboard – BG + Bolus + SMB + Carbs + Temp-Basal
+#  (handles Nightscout timeouts more gracefully)
 # ─────────────────────────────────────────────────────────────────────
-import streamlit as st, requests, pandas as pd
+import streamlit as st, requests, pandas as pd, time
+from datetime import datetime, time as dtime, timezone
 import plotly.graph_objects as go
-from datetime import datetime, time, timezone
 
-# ── Page + Nightscout creds ──────────────────────────────────────────
+# ── Page / creds ────────────────────────────────────────────────────
 st.set_page_config(page_title="Adriana Loop Dashboard", layout="wide")
 st.title("Adriana's Looping Dashboard (MVP)")
 
 NS_URL    = st.secrets["NIGHTSCOUT_URL"]
 NS_SECRET = st.secrets["API_SECRET"]
+HEADERS   = {"API-SECRET": NS_SECRET}
+TIMEOUT   = 30          # seconds for requests.get
+RETRY_PAUSE = 3         # seconds between 1st + 2nd attempt
 
-# ── Date-time pickers ────────────────────────────────────────────────
+# ── Date-time pickers ───────────────────────────────────────────────
 today = datetime.now(timezone.utc).date()
 c1, c2 = st.columns(2)
 with c1:
     start_date = st.date_input("Start date", value=today)
-    start_time = st.time_input("Start time", value=time(0, 0))
+    start_time = st.time_input("Start time",  value=dtime(0, 0))
 with c2:
     end_date   = st.date_input("End date",   value=today)
-    end_time   = st.time_input("End time",   value=time(23, 59))
+    end_time   = st.time_input("End time",   value=dtime(23, 59))
 
 start_dt = datetime.combine(start_date, start_time, tzinfo=timezone.utc)
 end_dt   = datetime.combine(end_date,   end_time,   tzinfo=timezone.utc)
 
-# ── Nightscout fetch (cached 10 min) ─────────────────────────────────
+# ── Nightscout fetch (cached 10 min) ────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_ns():
-    hdr = {"API-SECRET": NS_SECRET}
-    entries = requests.get(f"{NS_URL}/api/v1/entries.json?count=8640",
-                           headers=hdr, timeout=10).json()
-    treatments = requests.get(f"{NS_URL}/api/v1/treatments.json?count=2000",
-                              headers=hdr, timeout=10).json()
-    return pd.DataFrame(entries), pd.DataFrame(treatments)
+    """Download entries & treatments from Nightscout (with retry)."""
+    qs_entries = "api/v1/entries.json?count=8640"
+    qs_treat   = "api/v1/treatments.json?count=2000"
+
+    def _get(url):
+        return requests.get(url, headers=HEADERS, timeout=TIMEOUT).json()
+
+    for attempt in (1, 2):            # one retry
+        try:
+            entries   = _get(f"{NS_URL}/{qs_entries}")
+            treatments = _get(f"{NS_URL}/{qs_treat}")
+            return pd.DataFrame(entries), pd.DataFrame(treatments)
+        except requests.exceptions.ReadTimeout:
+            if attempt == 1:
+                time.sleep(RETRY_PAUSE)   # brief pause then retry
+            else:
+                raise   # bubble up on 2nd failure
 
 st.write("Fetching data from Nightscout…")
-entries_df, t_df = fetch_ns()
-st.success("Data loaded")
+try:
+    entries_df, t_df = fetch_ns()
+    st.success("Data loaded")
+except requests.exceptions.ReadTimeout:
+    st.error(
+        "Nightscout didn’t answer within 30 seconds on two attempts. "
+        "Please try **Rerun** (☝️ upper-right) or come back later."
+    )
+    st.stop()
 
-# ── Pre-processing ──────────────────────────────────────────────────
+# ── Pre-processing ─────────────────────────────────────────────────
 entries_df['time'] = pd.to_datetime(entries_df['dateString'], utc=True)
 entries_df['mmol'] = (entries_df['sgv'] / 18).round(1)
 
 t_df['time'] = pd.to_datetime(t_df['created_at'], utc=True)
-
-#  SMB vs Manual bolus
-t_df['isSMB'] = False
-if 'isSMB' in t_df.columns:
-    t_df.loc[t_df['isSMB'] == True, 'isSMB'] = True
-else:
-    t_df.loc[t_df['enteredBy'].str.contains('SMB', na=False), 'isSMB'] = True
+t_df['isSMB'] = t_df['enteredBy'].str.contains('SMB', na=False)
 
 bolus_df   = t_df[t_df['insulin'].notnull()]
 smb_df     = bolus_df[ bolus_df['isSMB']]
 manual_df  = bolus_df[~bolus_df['isSMB']]
 
-carb_df   = t_df[t_df['carbs'].fillna(0) > 0]             # carbs
-basal_df  = t_df[t_df['eventType'] == 'Temp Basal']       # temp-basal
-if 'rate' in basal_df.columns:
+carb_df    = t_df[t_df['carbs'].fillna(0) > 0]
+basal_df   = t_df[t_df['eventType'] == 'Temp Basal']
+if not basal_df.empty:
     basal_df['rate'] = basal_df['rate'].astype(float)
 
-# ── Window filter helper ────────────────────────────────────────────
+# ── Window filter helper ───────────────────────────────────────────
 def wnd(df): return df[(df['time'] >= start_dt) & (df['time'] <= end_dt)]
 
 entries_df = wnd(entries_df)
@@ -70,10 +86,10 @@ smb_df     = wnd(smb_df)
 carb_df    = wnd(carb_df)
 basal_df   = wnd(basal_df)
 
-# ── Plotly figure ───────────────────────────────────────────────────
+# ── Plotly figure ──────────────────────────────────────────────────
 fig = go.Figure()
 
-# BG
+# BG line (one-decimal hover)
 fig.add_trace(go.Scatter(
     x=entries_df['time'], y=entries_df['mmol'],
     mode='lines+markers', name='BG (mmol/L)', line=dict(color='green'),
@@ -101,7 +117,7 @@ fig.add_trace(go.Bar(
     x=carb_df['time'], y=carb_df['carbs'],
     name='Carbs (g)', yaxis='y3',
     marker_color='rgba(255,165,0,0.55)',
-    hovertemplate='%{y} g carbs<br>%{x|%Y-%m-%d %H:%M}<extra></extra>'
+    hovertemplate='%{y} g<br>%{x|%Y-%m-%d %H:%M}<extra></extra>'
 ))
 
 # Temp-basal
@@ -113,7 +129,7 @@ if not basal_df.empty:
         hovertemplate='%{y} U/h<br>%{x|%Y-%m-%d %H:%M}<extra></extra>'
     ))
 
-# ── Layout with 4 y-axes (anchor='free' fixes the error) ─────────────
+# ── Layout (4 y-axes) ──────────────────────────────────────────────
 fig.update_layout(
     title='BG + Insulin + Carbs + Basal',
     xaxis=dict(title='Time'),
