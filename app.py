@@ -1,5 +1,5 @@
 # ────────────────────────────────────────────────────────────────────
-#  Adriana Loop Dashboard – BG · Bolus/Carbs · Basal (+ scheduled)
+#  Adriana Loop Dashboard – BG · Bolus/Carbs · Basal (sched + temp)
 # ────────────────────────────────────────────────────────────────────
 import streamlit as st, requests, pandas as pd, re, json
 from datetime import datetime, time as dtime, timedelta, timezone
@@ -17,30 +17,28 @@ HDRS, TIMEOUT = {"API-SECRET": NS_SECRET}, 30
 today_utc = datetime.now(timezone.utc).date()
 c1, c2 = st.columns(2)
 with c1:
-    sd = st.date_input("Start date", today_utc)
+    sd   = st.date_input("Start date", today_utc)
     stime = st.time_input("Start time", dtime(0, 0))
 with c2:
-    ed = st.date_input("End date", today_utc)
-    etime = st.time_input("End time", dtime(23, 59))
+    ed   = st.date_input("End date",   today_utc)
+    etime = st.time_input("End time",  dtime(23, 59))
 
 start_dt = datetime.combine(sd, stime, tzinfo=timezone.utc)
 end_dt   = datetime.combine(ed, etime, tzinfo=timezone.utc)
 
-# ─── 2.  Helpers ────────────────────────────────────────────────────
+# ─── 2.  Nightscout fetch helpers  ──────────────────────────────────
 def _get(endpoint, count):
-    qs = f"api/v1/{endpoint}.json?count={count}"
-    r = requests.get(f"{NS_URL}/{qs}", headers=HDRS, timeout=TIMEOUT)
+    url = f"{NS_URL}/api/v1/{endpoint}.json?count={count}"
+    r   = requests.get(url, headers=HDRS, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_ns():
-    entries   = _get("entries",    8640)   # ~3 days CGM
-    treats    = _get("treatments", 2000)
-    profiles  = _get("profile",       1)   # newest profile set
-    return (pd.DataFrame(entries),
-            pd.DataFrame(treats),
-            json.loads(json.dumps(profiles))[0])   # ensure dict
+    entries  = _get("entries",    8640)        # ~3 days CGM
+    treats   = _get("treatments", 2000)
+    profile  = _get("profile",       1)[0]     # newest profile doc
+    return pd.DataFrame(entries), pd.DataFrame(treats), profile
 
 # ─── 3.  Load data ──────────────────────────────────────────────────
 st.write("Fetching Nightscout data…")
@@ -61,10 +59,10 @@ t_df['time'] = pd.to_datetime(t_df['created_at'], utc=True)
 bolus_col = next((c for c in ['insulin', 'bolus', 'amount'] if c in t_df.columns), None)
 if bolus_col:
     t_df[bolus_col] = pd.to_numeric(t_df[bolus_col], errors='coerce')
-    bolus_df = t_df[t_df[bolus_col].notnull()].copy()
+    bolus_df = t_df[t_df[bolus_col].notnull()][['time', bolus_col, 'enteredBy']].copy()
     bolus_df.rename(columns={bolus_col: 'units'}, inplace=True)
 else:
-    bolus_df = pd.DataFrame(columns=['time', 'units'])
+    bolus_df = pd.DataFrame(columns=['time', 'units', 'enteredBy'])
 
 smb_mask   = bolus_df['enteredBy'].str.contains('smb', flags=re.I, na=False)
 smb_df     = bolus_df[smb_mask]
@@ -73,23 +71,37 @@ carb_df    = t_df[t_df['carbs'].fillna(0) > 0][['time', 'carbs']]
 temp_df    = t_df[t_df['eventType'] == 'Temp Basal'].copy()
 temp_df['rate'] = pd.to_numeric(temp_df.get('rate'), errors='coerce')
 
-# ─── 6.  Scheduled basal from profile ───────────────────────────────
-def build_sched(profile_dict, window_start, window_end):
-    """Return a DataFrame with time & rate for the profile basal schedule."""
-    default = profile_dict['store'][profile_dict['defaultProfile']]
-    sched   = default['basal']   # list of {'i': min-of-day, 'rate': x}
-    dfs = []
-    day0 = window_start.replace(hour=0, minute=0, second=0, microsecond=0)
-    num_days = (window_end.date() - window_start.date()).days + 1
-    for d in range(num_days):
-        base = day0 + timedelta(days=d)
-        for seg in sched:
-            seg_time = base + timedelta(minutes=int(seg['i']))
-            dfs.append({'time': seg_time, 'rate': seg['rate']})
-        # add a final point @23:59 to make step look nice
-        dfs.append({'time': base + timedelta(hours=23, minutes=59, seconds=59),
-                    'rate': sched[-1]['rate']})
-    df = pd.DataFrame(dfs)
+# ─── 6.  Scheduled basal – robust parser  ───────────────────────────
+def build_sched(p_dict, window_start, window_end):
+    """Return scheduled-basal DataFrame between window_start & window_end."""
+    store   = p_dict['store'][p_dict['defaultProfile']]['basal']  # list of segments
+    seg_rows = []
+    base_day = window_start.replace(hour=0, minute=0, second=0, microsecond=0)
+    days     = (window_end.date() - window_start.date()).days + 1
+
+    def minutes_from_seg(seg):
+        if 'i' in seg:                       # old style
+            return int(seg['i'])
+        if 'timeAsSeconds' in seg:          # AndroidAPS export
+            return int(seg['timeAsSeconds']) // 60
+        if 'time' in seg:                   # "HH:MM"
+            t = datetime.strptime(seg['time'], "%H:%M")
+            return t.hour*60 + t.minute
+        raise KeyError("Un-recognised basal segment format")
+
+    for d in range(days):
+        day_zero = base_day + timedelta(days=d)
+        for seg in store:
+            minutes = minutes_from_seg(seg)
+            seg_time = day_zero + timedelta(minutes=minutes)
+            rate = seg.get('rate', seg.get('value'))
+            seg_rows.append({'time': seg_time, 'rate': rate})
+        # add a synthetic last point @23:59 for nice step-graph
+        last_rate = store[-1].get('rate', store[-1].get('value'))
+        seg_rows.append({'time': day_zero + timedelta(hours=23, minutes=59, seconds=59),
+                         'rate': last_rate})
+
+    df = pd.DataFrame(seg_rows)
     return df[(df['time'] >= window_start) & (df['time'] <= window_end)]
 
 sched_df = build_sched(profile, start_dt, end_dt)
@@ -110,7 +122,7 @@ st.write(
 fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.02,
                     row_heights=[0.45, 0.30, 0.25])
 
-# 9-A  BG
+# 9-A  BG line
 fig.add_trace(go.Scatter(
     x=entries_df['time'], y=entries_df['mmol'],
     mode='lines+markers', name='BG (mmol/L)', line=dict(color='green'),
@@ -118,26 +130,26 @@ fig.add_trace(go.Scatter(
 ), row=1, col=1)
 
 # 9-B  Bolus / carbs
-for df, name, col in [
-    (manual_df, 'Manual Bolus (U)', 'rgba(0,102,204,0.6)'),
-    (smb_df,    'SMB (U)',          'rgba(255,99,132,0.6)'),
-    (carb_df,   'Carbs (g)',        'rgba(255,165,0,0.55)')]:
-    if not df.empty:
-        fig.add_trace(go.Bar(
-            x=df['time'], y=df[df.columns[-1]],
-            name=name, marker_color=col,
-            hovertemplate='%{y} '+name.split()[0]+
-                          '<br>%{x|%Y-%m-%d %H:%M}<extra></extra>'
-        ), row=2, col=1)
+def add_bar(df, name, colour):
+    if df.empty: return
+    fig.add_trace(go.Bar(
+        x=df['time'], y=df[df.columns[-1]], name=name,
+        marker_color=colour,
+        hovertemplate='%{y} '+name.split()[0]+'<br>%{x|%Y-%m-%d %H:%M}<extra></extra>'
+    ), row=2, col=1)
 
-# 9-C  Basal
-if not sched_df.empty:           # scheduled (grey dashed)
+add_bar(manual_df, 'Manual Bolus (U)', 'rgba(0,102,204,0.6)')
+add_bar(smb_df,    'SMB (U)',          'rgba(255,99,132,0.6)')
+add_bar(carb_df,   'Carbs (g)',        'rgba(255,165,0,0.55)')
+
+# 9-C  Basal panel
+if not sched_df.empty:
     fig.add_trace(go.Scatter(
         x=sched_df['time'], y=sched_df['rate'],
         name='Scheduled Basal (U/h)', mode='lines', line_shape='hv',
         line=dict(color='grey', dash='dash')
     ), row=3, col=1)
-if not temp_df.empty:            # temporary (purple)
+if not temp_df.empty:
     fig.add_trace(go.Scatter(
         x=temp_df['time'], y=temp_df['rate'],
         name='Temp Basal (U/h)', mode='lines', line_shape='hv',
@@ -147,7 +159,7 @@ if not temp_df.empty:            # temporary (purple)
 # ─── 10.  Layout ────────────────────────────────────────────────────
 fig.update_yaxes(title_text="BG (mmol/L)", row=1, col=1, range=[2, 15])
 fig.update_yaxes(title_text="Bolus / Carbs", row=2, col=1)
-fig.update_yaxes(title_text="Basal (U/h)",  row=3, col=1)
+fig.update_yaxes(title_text="Basal (U/h)", row=3, col=1)
 
 fig.update_layout(
     height=800, bargap=0.15, legend=dict(orientation='h'),
