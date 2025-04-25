@@ -10,7 +10,6 @@ from datetime import datetime, date, time as dtime, timedelta
 from typing import Tuple, Dict, Optional
 
 # Constants
-DAYS_BACK = 30  # Default days to fetch
 READ_TIMEOUT = 30  # seconds per request
 MAX_RETRIES = 2
 
@@ -30,17 +29,18 @@ LOCAL_TZ = pytz.timezone(time.tzname[0]) if time.tzname else pytz.UTC
 
 # ────────── Data Fetching ──────────
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_nightscout_data() -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
+def fetch_nightscout_data(start_date: datetime, end_date: datetime) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
     """
-    Fetch data from Nightscout API with retry logic.
+    Fetch only data needed for the selected date range with retry logic.
     Returns: (entries_df, treatments_df, profile_dict)
     """
     headers = {"API-SECRET": NS_SECRET}
-    since = int((datetime.utcnow() - timedelta(days=DAYS_BACK)).timestamp() * 1000)
+    since = int(start_date.timestamp() * 1000)
+    until = int(end_date.timestamp() * 1000)
     
     endpoints = {
-        "entries": f"{NS_URL}/api/v1/entries.json?find[date][$gte]={since}&count=8640",
-        "treatments": f"{NS_URL}/api/v1/treatments.json?find[created_at][$gte]={since}&count=4000",
+        "entries": f"{NS_URL}/api/v1/entries.json?find[date][$gte]={since}&find[date][$lte]={until}",
+        "treatments": f"{NS_URL}/api/v1/treatments.json?find[created_at][$gte]={since}&find[created_at][$lte]={until}",
         "profile": f"{NS_URL}/api/v1/profile.json"
     }
 
@@ -150,11 +150,15 @@ def main():
     # Date selection
     start_dt, end_dt = setup_date_selectors()
     
+    # Show loading message if fetching >1 day of data
+    if (end_dt - start_dt) > timedelta(days=1):
+        st.info("⚠️ Loading extended date range... This may take longer")
+    
     # Data loading
     with st.spinner("Fetching data from Nightscout..."):
-        entries_df, treats_df, profile = fetch_nightscout_data()
+        entries_df, treats_df, profile = fetch_nightscout_data(start_dt, end_dt)
     
-    # Filter data to selected time range
+    # Filter data to selected time range (redundant but ensures safety)
     entries_df = entries_df[(entries_df["time"] >= start_dt) & (entries_df["time"] <= end_dt)]
     treats_df = treats_df[(treats_df["time"] >= start_dt) & (treats_df["time"] <= end_dt)]
     
@@ -173,8 +177,10 @@ def main():
     # Calculate dynamic display limits
     max_bolus = bolus_df["insulin"].max() if not bolus_df.empty else 0
     bolus_ylim = max(1, max_bolus * 1.3)  # 30% padding
-    carb_y_pos = bolus_ylim * 1.05
-    carb_sizes = carb_df["carbs"].fillna(0).apply(lambda g: max(6, min(g * 0.6, 30)))
+    
+    # ────────── Improved Carb Visualization ──────────
+    carb_y_pos = bolus_ylim * 0.9  # Lower position (90% of bolus range)
+    carb_sizes = carb_df["carbs"].fillna(0).apply(lambda g: max(8, min(g * 0.8, 35)))  # Larger bubbles
     
     # ────────── Visualization ──────────
     fig = make_subplots(
@@ -197,7 +203,7 @@ def main():
         row=1, col=1
     )
     
-    # 2. Boluses and Carbs
+    # 2. Boluses and Carbs (Improved)
     fig.add_trace(
         go.Bar(
             x=manual_df["time"],
@@ -223,10 +229,17 @@ def main():
             x=carb_df["time"],
             y=[carb_y_pos] * len(carb_df),
             mode="markers+text",
-            marker=dict(color="orange", size=carb_sizes),
-            text=carb_df["carbs"].astype(int).astype(str) + " g",
+            marker=dict(
+                color="orange",
+                size=carb_sizes,
+                line=dict(width=1, color="darkorange")  # Border for visibility
+            ),
+            text=carb_df["carbs"].astype(int).astype(str) + "g",
             textposition="top center",
-            name="Carbs"
+            name="Carbs",
+            hoverinfo="text+x",
+            hovertext=carb_df["carbs"].astype(int).astype(str) + "g carbs<br>" + 
+                      carb_df["time"].dt.strftime("%H:%M")
         ),
         row=2, col=1
     )
@@ -266,10 +279,16 @@ def main():
         bargap=0.15,
         legend_orientation="h",
         legend_y=-0.12,
-        margin=dict(t=50, r=20, b=60, l=60)
+        margin=dict(t=50, r=20, b=60, l=60),
+        hovermode="x unified"  # Better hover interactions
     )
     
     st.plotly_chart(fig, use_container_width=True)
+    
+    # Add manual refresh button
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
 
 if __name__ == "__main__":
     main()
