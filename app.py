@@ -1,163 +1,176 @@
-# ──────────────────────────────────────────────────────────────────────────────
-#  Adriana Loop Dashboard  •  Streamlit  •  Nightscout ➜ 3-panel Tidepool-style
-# ──────────────────────────────────────────────────────────────────────────────
-import os, requests, json, math
-from datetime import datetime, date, time, timedelta, timezone
-import pytz, pandas as pd, numpy as np, streamlit as st
-from plotly.subplots import make_subplots
-import plotly.graph_objects as go
+# ────────────────────────────────────────────
+#  Adriana Loop Dashboard  ·  Streamlit 1.33
+#  one-file version with robust Nightscout IO
+# ────────────────────────────────────────────
+#  Requirements (in requirements.txt):
+#  streamlit pandas plotly requests python-dateutil pytz urllib3
+# ────────────────────────────────────────────
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-NS_URL      = st.secrets.get("NIGHTSCOUT_URL"     , "").rstrip("/")
-API_SECRET  = st.secrets.get("API_SECRET", "")
+import os, math, json, time
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import pytz
+from datetime import datetime, timedelta, date
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry   import Retry
+
+
+# ╭──────────────────────── configuration ───────────────────────╮
+NS_URL      = st.secrets.get("NIGHTSCOUT_URL" , "").rstrip("/")
+NS_URL      = NS_URL or os.getenv("NIGHTSCOUT_URL")   # fallback
+API_SECRET  = st.secrets.get("API_SECRET"     , "") or os.getenv("API_SECRET", "")
+LOCAL_TZ    = st.secrets.get("LOCAL_TZ"       , "Europe/Berlin")
+
 HEADERS     = {"api-secret": API_SECRET} if API_SECRET else {}
-LOCAL_TZ    = pytz.timezone(str(st.secrets.get("LOCAL_TZ","UTC")))  # e.g. "Europe/Berlin"
-REQ_TIMEOUT = 15                                                    # seconds
+REQ_TIMEOUT = 45           # seconds per HTTP request
+BLOCK_H     = 12           # hours fetched per sub-request
+MAX_RETRIES = 3            # automatic retries per sub-request
+# ╰──────────────────────────────────────────────────────────────╯
 
-# ── HELPERS ───────────────────────────────────────────────────────────────────
-def _pick_time_col(df: pd.DataFrame) -> str:
-    for c in ("time","date","dateString","created_at","mills","timestamp"):
-        if c in df.columns: return c
-    raise KeyError("No timestamp column found")
 
-def _to_dt(s):
-    # accepts ms-epoch or iso8601
-    try:   return pd.to_datetime(s, unit="ms", utc=True)
-    except Exception:
-        return pd.to_datetime(s,             utc=True, errors="coerce")
+# ╭─ helpers ────────────────────────────────────────────────────╮
+def _session_with_retries():
+    retry = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=1.5,    # 0 s, 1.5 s, 3 s, …
+        status_forcelist=[502, 503, 504],
+        raise_on_status=False
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s = requests.Session()
+    s.mount("https://", adapter)
+    s.mount("http://",  adapter)
+    return s
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_ns(since_ms: int, until_ms: int):
-    # entries (CGM)
-    entries_url = f"{NS_URL}/api/v1/entries.json"
-    params_e    = {"find[date][$gte]":since_ms, "find[date][$lte]":until_ms}
-    r           = requests.get(entries_url, params=params_e, headers=HEADERS, timeout=REQ_TIMEOUT)
+
+def _fetch_chunk(endpoint: str, start_ms: int, end_ms: int) -> list[dict]:
+    """Download one small time slice from Nightscout."""
+    url   = f"{NS_URL}{endpoint}"
+    parms = {"find[date][$gte]": start_ms,
+             "find[date][$lte]": end_ms,
+             "count": 10000,
+             "_ttl": 0}            # disable server cache
+    r = SESSION.get(url, params=parms, headers=HEADERS, timeout=REQ_TIMEOUT)
     r.raise_for_status()
-    e_df        = pd.DataFrame(r.json())
-    if e_df.empty: e_df = pd.DataFrame(columns=["sgv","time"])
-    e_df        = ( e_df.assign(time=lambda d:_to_dt(d[_pick_time_col(d)]))
-                         .dropna(subset=["time"])
-                         .sort_values("time") )
+    return r.json()
 
-    # treatments
-    treats_url  = f"{NS_URL}/api/v1/treatments.json"
-    params_t    = {"find[created_at][$gte]":since_ms, "find[created_at][$lte]":until_ms}
-    r           = requests.get(treats_url, params=params_t, headers=HEADERS, timeout=REQ_TIMEOUT)
-    r.raise_for_status()
-    t_df        = pd.DataFrame(r.json())
-    if t_df.empty: t_df = pd.DataFrame(columns=["eventType","time"])
-    t_df        = ( t_df.assign(time=lambda d:_to_dt(d[_pick_time_col(d)]))
-                         .dropna(subset=["time"])
-                         .sort_values("time") )
 
-    # latest profile (for scheduled basal)
-    prof_url    = f"{NS_URL}/api/v1/profile.json?count=1"
-    prof        = requests.get(prof_url, headers=HEADERS, timeout=REQ_TIMEOUT).json()[0]
-    return e_df, t_df, prof
+def _iter_timeblocks(start_ms: int, end_ms: int, block_h=BLOCK_H):
+    block_ms = block_h * 3600_000
+    cur = start_ms
+    while cur < end_ms:
+        yield cur, min(cur + block_ms - 1, end_ms)
+        cur += block_ms
 
-def build_sched(profile, start_dt, end_dt):
-    rows = []
-    for seg in profile["store"]["Default"]["basalprofile"]:        # "Default" profile name
-        rate = seg["value"]
-        seg_start = datetime.combine(start_dt.date(), time()) + timedelta(minutes=seg["time"]//60)
-        while seg_start < end_dt:
-            seg_end = seg_start + timedelta(minutes=profile["store"]["Default"]["basalprofile"][(seg["i"]+1)%len(profile["store"]["Default"]["basalprofile"])]["time"]//60)
-            rows.append({"time":seg_start.replace(tzinfo=timezone.utc),"rate":rate})
-            seg_start = seg_end
-    return pd.DataFrame(rows)
 
-# ── UI  – DATE PICKERS ────────────────────────────────────────────────────────
-st.set_page_config(page_title="Adriana Dashboard", layout="wide")
-st.title("Adriana Loop Dashboard (MVP)")
+def fetch_ns(start_ms: int, end_ms: int):
+    """Robust Nightscout fetch that streams data in 12-h blocks."""
+    entries, treats = [], []
 
-col1, col2 = st.columns(2)
-with col1:
-    sel_date = st.date_input("Date", date.today())
-with col2:
-    tz_now   = datetime.now(LOCAL_TZ).time()
-    start_t  = st.time_input("Start time", time(0,0))
-    end_t    = st.time_input("End time"  , time(23,59,59))
+    for s, e in _iter_timeblocks(start_ms, end_ms):
+        if st.session_state.get("stop_fetch"):               # user cancelled?
+            break
+        entries += _fetch_chunk("/api/v1/entries.json",     s, e)
+        treats  += _fetch_chunk("/api/v1/treatments.json",  s, e)
 
-start_dt = LOCAL_TZ.localize(datetime.combine(sel_date, start_t)).astimezone(pytz.UTC)
-end_dt   = LOCAL_TZ.localize(datetime.combine(sel_date, end_t  )).astimezone(pytz.UTC)
-start_ms, end_ms = int(start_dt.timestamp()*1000), int(end_dt.timestamp()*1000)
+    # ── convert to DataFrames ───────────────────────────
+    entries_df = (pd.DataFrame(entries)
+                    .assign(time=lambda d: pd.to_datetime(d["date"], unit="ms"))
+                    .sort_values("time"))
+    treats_df  = (pd.DataFrame(treats)
+                    .assign(time=lambda d: pd.to_datetime(d["created_at"]))
+                    .sort_values("time"))
 
-st.markdown("Fetching Nightscout …")
-entries_df, treats_df, profile = fetch_ns(start_ms, end_ms)
+    # ── profile (single call, small) ─────────────────────
+    prof_url = f"{NS_URL}/api/v1/profile"
+    prof_js  = SESSION.get(prof_url, headers=HEADERS, timeout=REQ_TIMEOUT).json()
+    profile  = prof_js[0] if prof_js else {}
 
-# ── DATAFRAMES ───────────────────────────────────────────────────────────────
-bg_df    = entries_df[["time","sgv"]].dropna()
+    return entries_df, treats_df, profile
+# ╰──────────────────────────────────────────────────────────────╯
 
-bol_df   = treats_df.loc[treats_df["eventType"].isin(("Correction Bolus","Bolus"))].copy()
-bol_df["insulin"] = bol_df["insulin"].fillna(bol_df.get("amount",np.nan))
-bol_df   = bol_df.dropna(subset=["insulin"])
-bol_df["kind"]    = np.where(bol_df.get("enteredBy","").str.contains("smb",case=False),"SMB","Manual")
 
-carb_df  = treats_df.loc[treats_df["carbs"].notnull() & (treats_df["carbs"]>0), ["time","carbs"]]
+# ╭─ UI: date range selector ───────────────────────────────────╮
+st.set_page_config(page_title="Adriana Loop dashboard", layout="wide")
+st.title("📊  Adriana CGM / Loop dashboard")
 
-temp_df  = treats_df.loc[treats_df["eventType"]=="Temp Basal"].copy()
-temp_df  = temp_df.assign(rate=lambda d:d["rate"].fillna(d["absolute"])).dropna(subset=["rate"]).sort_values("time")
+local_tz = pytz.timezone(LOCAL_TZ)
+today    = date.today()
 
-sched_df = build_sched(profile, start_dt, end_dt)
+col1, col2, col3 = st.columns(3)
+with col1: start_date = st.date_input("Start date", today - timedelta(days=1))
+with col2: end_date   = st.date_input("End date",   today)
+with col3:
+    if st.button("Reload"):
+        st.session_state.pop("ns_cache", None)   # clear cache
 
-# ── PLOTLY SUB-PLOTS ─────────────────────────────────────────────────────────
-fig = make_subplots(
-    rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-    row_heights=[0.4,0.3,0.3], specs=[[{}],[{}],[{}]]
-)
+# transform to UTC ms
+start_dt  = local_tz.localize(datetime.combine(start_date, datetime.min.time()))
+end_dt    = local_tz.localize(datetime.combine(end_date,   datetime.max.time()))
+start_ms  = int(start_dt.timestamp()*1000)
+end_ms    = int(end_dt.timestamp()*1000)
 
-# 1️⃣ BG line
-fig.add_trace(go.Scatter(
-    x=bg_df["time"], y=bg_df["sgv"]/18.0,   # mg/dl ➞ mmol/L
-    mode="lines+markers", line=dict(color="mediumseagreen"),
-    hovertemplate="%{y:.1f} mmol/L<br>%{x|%H:%M}", name="BG"
-), row=1,col=1)
 
-# 2️⃣ Bolus & Carbs
-for kind,color in [("Manual","royalblue"),("SMB","lightskyblue")]:
-    sub = bol_df.loc[bol_df["kind"]==kind]
-    if not sub.empty:
-        fig.add_trace(go.Bar(
-            x=sub["time"], y=sub["insulin"], name=kind,
-            marker_color=color, hovertemplate=f"{kind}: "+"%{y:.2f} U<br>%{x|%H:%M}"
-        ), row=2, col=1)
+# ╭─ fetch data (cached) ───────────────────────────────────────╮
+SESSION = _session_with_retries()
 
+@st.cache_data(ttl=300, show_spinner="⏳  Contacting Nightscout…")
+def _cached_fetch(s_ms, e_ms):
+    return fetch_ns(s_ms, e_ms)
+
+try:
+    entries_df, treats_df, profile = _cached_fetch(start_ms, end_ms)
+except requests.exceptions.RequestException as err:
+    st.error(f"Nightscout error → {err}")
+    st.stop()
+
+if entries_df.empty:
+    st.warning("No CGM data in selected range.")
+    st.stop()
+
+# ╭─ split treatment types ─────────────────────────────────────╮
+bol_df  = treats_df.query("eventType in ['Correction Bolus', 'Bolus', 'Meal Bolus']")
+smb_df  = treats_df.query("eventType == 'Note' and notes == 'SMB'")   # adapt if Trio tags SMBs differently
+carb_df = treats_df.query("carbs.notnull() & (carbs > 0)")
+temp_df = treats_df.query("eventType == 'Temp Basal'")
+
+# ╭─ BG chart ──────────────────────────────────────────────────╮
+fig_bg = px.line(entries_df, x="time", y="sgv", title="Glucose (mg/dL)")
+fig_bg.update_traces(line=dict(color="#1f77b4", width=2))
+fig_bg.update_layout(height=250, margin=dict(l=60, r=30, t=40, b=40))
+st.plotly_chart(fig_bg, use_container_width=True)
+
+# ╭─ Bolus / carbs chart ───────────────────────────────────────╮
+bol_max = bol_df["insulin"].max() if not bol_df.empty else 1
+fig_bc  = px.bar(bol_df, x="time", y="insulin", color_discrete_sequence=["#d62728"],
+                 title="Bolus vs Carbs")
+fig_bc.update_layout(yaxis_title="Units", yaxis_range=[0, bol_max*1.2],
+                     height=220, margin=dict(l=60, r=30, t=40, b=40))
+
+# add SMBs ▸▼
+if not smb_df.empty:
+    fig_bc.add_bar(x=smb_df["time"], y=smb_df["insulin"],
+                   name="SMB", marker_color="#ff9896")
+
+# add carbs as sized bubbles ▸▼
 if not carb_df.empty:
-    fig.add_trace(go.Scatter(
-        x=carb_df["time"], y=[bol_df["insulin"].max()*1.05]*len(carb_df),
-        mode="markers+text",
-        marker=dict(size=np.clip(carb_df["carbs"],5,30), color="sandybrown", line=dict(width=1,color="black")),
-        text=carb_df["carbs"].astype(int),
-        textposition="top center",
-        name="Carbs",
-        hovertemplate="%{text} g<br>%{x|%H:%M}"
-    ), row=2, col=1)
+    fig_bc.add_scatter(x=carb_df["time"], y=[bol_max*1.05]*len(carb_df),
+                       mode="markers+text",
+                       marker=dict(size=carb_df["carbs"], color="#2ca02c", opacity=.7),
+                       text=carb_df["carbs"].astype(int).astype(str)+" g",
+                       textposition="top center",
+                       name="Carbs")
 
-# 3️⃣ Basal
-# scheduled
-fig.add_trace(go.Scatter(
-    x=sched_df["time"], y=sched_df["rate"],
-    mode="lines", line=dict(color="lightgrey", width=1, dash="dash"),
-    name="Scheduled basal", hovertemplate="%{y:.2f} U/h<br>%{x|%H:%M}"
-), row=3,col=1)
+st.plotly_chart(fig_bc, use_container_width=True)
 
-# temp basal as filled area
-if not temp_df.empty:
-    fig.add_trace(go.Scatter(
-        x=temp_df["time"], y=temp_df["rate"],
-        mode="lines", line=dict(color="tomato"),
-        fill="tozeroy", fillcolor="rgba(255,99,71,0.3)",
-        name="Temp basal", hovertemplate="%{y:.2f} U/h<br>%{x|%H:%M}"
-    ), row=3,col=1)
+# ╭─ Basal chart ───────────────────────────────────────────────╮
+fig_basal = px.step(temp_df, x="time", y="rate", title="Temp basal (U/h)",
+                    color_discrete_sequence=["#9467bd"])
+fig_basal.update_traces(fill="tozeroy", line_shape="hv")
+fig_basal.update_layout(height=180, margin=dict(l=60, r=30, t=40, b=40))
+st.plotly_chart(fig_basal, use_container_width=True)
 
-# ── LAYOUT ───────────────────────────────────────────────────────────────────
-max_bolus = bol_df["insulin"].max() if not bol_df.empty else 1
-fig.update_yaxes(title_text="mmol/L", row=1,col=1)
-fig.update_yaxes(title_text="Insulin U", range=[0,max_bolus*1.3], row=2,col=1)
-fig.update_yaxes(title_text="Basal U/h", row=3,col=1)
-fig.update_layout(
-    height=800, bargap=0.15, legend=dict(orientation="h",y=1.02,x=0),
-    hovermode="x unified", template="plotly_white"
-)
-
-st.plotly_chart(fig, use_container_width=True)
+st.caption("⏱️  All API calls are cached for 5 minutes.  \
+Blue = BG • Red = manual bolus • Pink = SMB • Green = carbs • Purple = temp basal")
