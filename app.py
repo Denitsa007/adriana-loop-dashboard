@@ -24,7 +24,7 @@ st.write("Fetching data from Nightscout...")
 entries_df, treatments_df, devicestatus_df = fetch_nightscout_data()
 st.success("Data loaded.")
 
-# Format timestamps and BG values
+# Ensure proper datetime formatting for all time columns
 entries_df['time'] = pd.to_datetime(entries_df['dateString'], errors='coerce')
 entries_df['mmol'] = entries_df['sgv'] / 18.0  # Convert mg/dL to mmol/L
 
@@ -45,9 +45,13 @@ with col2:
     end_date = st.date_input("End date", value=default_end.date())
     end_hour = st.time_input("End time", value=default_end.time())
 
-# Combine into datetime and force proper type
+# Combine into datetime and ensure proper type
 start_time = pd.to_datetime(datetime.combine(start_date, start_hour))
 end_time = pd.to_datetime(datetime.combine(end_date, end_hour))
+
+# Ensure both start_time/end_time are datetime64[ns] for comparison
+start_time = pd.to_datetime(start_time)
+end_time = pd.to_datetime(end_time)
 
 # Filter all data
 entries_df = entries_df[
