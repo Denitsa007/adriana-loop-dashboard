@@ -25,13 +25,13 @@ entries_df, treatments_df, devicestatus_df = fetch_nightscout_data()
 st.success("Data loaded.")
 
 # Format timestamps and BG values
-entries_df['time'] = pd.to_datetime(entries_df['dateString'])
+entries_df['time'] = pd.to_datetime(entries_df['dateString'], errors='coerce')
 entries_df['mmol'] = entries_df['sgv'] / 18.0  # Convert mg/dL to mmol/L
 
-treatments_df['time'] = pd.to_datetime(treatments_df['created_at'])
+treatments_df['time'] = pd.to_datetime(treatments_df['created_at'], errors='coerce')
 bolus_df = treatments_df[treatments_df['insulin'].notnull()]
 
-# Default range: today from 00:00 to 23:59
+# Default: today from 00:00 to 23:59
 today = datetime.now().date()
 default_start = datetime.combine(today, time.min)
 default_end = datetime.combine(today, time.max)
@@ -45,13 +45,17 @@ with col2:
     end_date = st.date_input("End date", value=default_end.date())
     end_hour = st.time_input("End time", value=default_end.time())
 
-# Combine to datetimes
+# Combine into datetime and force proper type
 start_time = pd.to_datetime(datetime.combine(start_date, start_hour))
 end_time = pd.to_datetime(datetime.combine(end_date, end_hour))
 
 # Filter all data
-entries_df = entries_df[(entries_df['time'] >= start_time) & (entries_df['time'] <= end_time)]
-bolus_df = bolus_df[(bolus_df['time'] >= start_time) & (bolus_df['time'] <= end_time)]
+entries_df = entries_df[
+    (entries_df['time'] >= start_time) & (entries_df['time'] <= end_time)
+]
+bolus_df = bolus_df[
+    (bolus_df['time'] >= start_time) & (bolus_df['time'] <= end_time)
+]
 
 # Plot
 fig = go.Figure()
@@ -65,7 +69,7 @@ fig.add_trace(go.Scatter(
     line=dict(color='green')
 ))
 
-# Bolus Bars
+# Bolus Bars (manual + SMB combined)
 fig.add_trace(go.Bar(
     x=bolus_df['time'],
     y=bolus_df['insulin'],
