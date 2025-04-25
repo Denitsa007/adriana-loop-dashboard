@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, time
 
 st.set_page_config(page_title="Adriana Loop Dashboard", layout="wide")
 st.title("Adriana's Looping Dashboard — Now with Timeline!")
@@ -31,17 +31,23 @@ entries_df['mmol'] = entries_df['sgv'] / 18.0  # Convert mg/dL to mmol/L
 treatments_df['time'] = pd.to_datetime(treatments_df['created_at'])
 bolus_df = treatments_df[treatments_df['insulin'].notnull()]
 
-# Time filter UI
+# Default range: today from 00:00 to 23:59
+today = datetime.now().date()
+default_start = datetime.combine(today, time.min)
+default_end = datetime.combine(today, time.max)
+
+# Time filter UI (with today as default)
 col1, col2 = st.columns(2)
 with col1:
-    start_date = st.date_input("Start date", value=entries_df['time'].min().date())
-    start_hour = st.time_input("Start time", value=entries_df['time'].min().time())
+    start_date = st.date_input("Start date", value=default_start.date())
+    start_hour = st.time_input("Start time", value=default_start.time())
 with col2:
-    end_date = st.date_input("End date", value=entries_df['time'].max().date())
-    end_hour = st.time_input("End time", value=entries_df['time'].max().time())
+    end_date = st.date_input("End date", value=default_end.date())
+    end_hour = st.time_input("End time", value=default_end.time())
 
-start_time = datetime.combine(start_date, start_hour)
-end_time = datetime.combine(end_date, end_hour)
+# Combine to datetimes
+start_time = pd.to_datetime(datetime.combine(start_date, start_hour))
+end_time = pd.to_datetime(datetime.combine(end_date, end_hour))
 
 # Filter all data
 entries_df = entries_df[(entries_df['time'] >= start_time) & (entries_df['time'] <= end_time)]
@@ -59,7 +65,7 @@ fig.add_trace(go.Scatter(
     line=dict(color='green')
 ))
 
-# Bolus Bars (manual + SMB combined)
+# Bolus Bars
 fig.add_trace(go.Bar(
     x=bolus_df['time'],
     y=bolus_df['insulin'],
