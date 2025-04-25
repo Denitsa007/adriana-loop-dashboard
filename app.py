@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 NS_URL      = "https://adriana007.eu.nightscoutpro.com"
-NS_SECRET   = st.secrets.get("NS_SECRET", "")            # ← add in ⚙️-Secrets if required
+NS_SECRET = st.secrets.get("API_SECRET", "")            # ← add in ⚙️-Secrets if required
 LOCAL_TZ    = pytz.timezone("Europe/Berlin")
 TIMEOUT     = (6, 15)
 
