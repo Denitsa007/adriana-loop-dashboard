@@ -1,129 +1,163 @@
-#  Adriana – Loop dashboard  (full file)
-import json, requests, pytz, streamlit as st
-from datetime import datetime, date, time, timedelta
-import pandas as pd
-import plotly.graph_objects as go
+# ──────────────────────────────────────────────────────────────────────────────
+#  Adriana Loop Dashboard  •  Streamlit  •  Nightscout ➜ 3-panel Tidepool-style
+# ──────────────────────────────────────────────────────────────────────────────
+import os, requests, json, math
+from datetime import datetime, date, time, timedelta, timezone
+import pytz, pandas as pd, numpy as np, streamlit as st
 from plotly.subplots import make_subplots
+import plotly.graph_objects as go
 
-NS_URL      = "https://adriana007.eu.nightscoutpro.com"
-NS_SECRET = st.secrets.get("API_SECRET", "")            # ← add in ⚙️-Secrets if required
-LOCAL_TZ    = pytz.timezone("Europe/Berlin")
-TIMEOUT     = (6, 15)
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+NS_URL      = st.secrets.get("NS_URL"     , "").rstrip("/")
+API_SECRET  = st.secrets.get("API_SECRET", "")
+HEADERS     = {"api-secret": API_SECRET} if API_SECRET else {}
+LOCAL_TZ    = pytz.timezone(str(st.secrets.get("LOCAL_TZ","UTC")))  # e.g. "Europe/Berlin"
+REQ_TIMEOUT = 15                                                    # seconds
 
-# ───────────────── helpers ──────────────────────────────────────────────────
-def _to_utc(ts):
-    if isinstance(ts, int):
-        return pd.to_datetime(ts, unit="ms", utc=True)
-    return pd.to_datetime(ts.rstrip("Z"), utc=True, errors="coerce")
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+def _pick_time_col(df: pd.DataFrame) -> str:
+    for c in ("time","date","dateString","created_at","mills","timestamp"):
+        if c in df.columns: return c
+    raise KeyError("No timestamp column found")
 
-def _pick_time(df):
-    for col in ("date", "dateString", "created_at", "time"):
-        if col in df.columns:
-            return df[col].apply(_to_utc)
-    raise KeyError("no timestamp column in JSON")
+def _to_dt(s):
+    # accepts ms-epoch or iso8601
+    try:   return pd.to_datetime(s, unit="ms", utc=True)
+    except Exception:
+        return pd.to_datetime(s,             utc=True, errors="coerce")
 
-def _as_df(payload):
-    """return always a DataFrame, even for scalar / empty JSON"""
-    if isinstance(payload, list):
-        return pd.DataFrame(payload)
-    if isinstance(payload, dict):
-        return pd.DataFrame([payload])
-    return pd.DataFrame()          # fallback for '', None …
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_ns(since_ms: int, until_ms: int):
+    # entries (CGM)
+    entries_url = f"{NS_URL}/api/v1/entries.json"
+    params_e    = {"find[date][$gte]":since_ms, "find[date][$lte]":until_ms}
+    r           = requests.get(entries_url, params=params_e, headers=HEADERS, timeout=REQ_TIMEOUT)
+    r.raise_for_status()
+    e_df        = pd.DataFrame(r.json())
+    if e_df.empty: e_df = pd.DataFrame(columns=["sgv","time"])
+    e_df        = ( e_df.assign(time=lambda d:_to_dt(d[_pick_time_col(d)]))
+                         .dropna(subset=["time"])
+                         .sort_values("time") )
 
-@st.cache_data(show_spinner=False, ttl=600)
-def fetch_ns(start_ms, end_ms):
-    params = {
-        "find[date][$gte]": start_ms,
-        "find[date][$lte]": end_ms,
-        "token": NS_SECRET or None
-    }
+    # treatments
+    treats_url  = f"{NS_URL}/api/v1/treatments.json"
+    params_t    = {"find[created_at][$gte]":since_ms, "find[created_at][$lte]":until_ms}
+    r           = requests.get(treats_url, params=params_t, headers=HEADERS, timeout=REQ_TIMEOUT)
+    r.raise_for_status()
+    t_df        = pd.DataFrame(r.json())
+    if t_df.empty: t_df = pd.DataFrame(columns=["eventType","time"])
+    t_df        = ( t_df.assign(time=lambda d:_to_dt(d[_pick_time_col(d)]))
+                         .dropna(subset=["time"])
+                         .sort_values("time") )
 
-    def _get(path):
-        r = requests.get(f"{NS_URL}{path}", params=params, timeout=TIMEOUT)
-        if r.status_code != 200:
-            raise RuntimeError(f"Nightscout error {r.status_code}: {r.text[:120]}")
-        return _as_df(r.json())
+    # latest profile (for scheduled basal)
+    prof_url    = f"{NS_URL}/api/v1/profile.json?count=1"
+    prof        = requests.get(prof_url, headers=HEADERS, timeout=REQ_TIMEOUT).json()[0]
+    return e_df, t_df, prof
 
-    entries_df  = _get("/api/v1/entries.json").assign(time=lambda d: _pick_time(d)).sort_values("time")
-    treats_df   = _get("/api/v1/treatments.json")
-    if not treats_df.empty:
-        treats_df["time"] = _pick_time(treats_df)
+def build_sched(profile, start_dt, end_dt):
+    rows = []
+    for seg in profile["store"]["Default"]["basalprofile"]:        # "Default" profile name
+        rate = seg["value"]
+        seg_start = datetime.combine(start_dt.date(), time()) + timedelta(minutes=seg["time"]//60)
+        while seg_start < end_dt:
+            seg_end = seg_start + timedelta(minutes=profile["store"]["Default"]["basalprofile"][(seg["i"]+1)%len(profile["store"]["Default"]["basalprofile"])]["time"]//60)
+            rows.append({"time":seg_start.replace(tzinfo=timezone.utc),"rate":rate})
+            seg_start = seg_end
+    return pd.DataFrame(rows)
 
-    profile     = _get("/api/v1/profile.json").iloc[0] if not _get("/api/v1/profile.json").empty else {}
+# ── UI  – DATE PICKERS ────────────────────────────────────────────────────────
+st.set_page_config(page_title="Adriana Dashboard", layout="wide")
+st.title("Adriana Loop Dashboard (MVP)")
 
-    return entries_df, treats_df, profile
+col1, col2 = st.columns(2)
+with col1:
+    sel_date = st.date_input("Date", date.today())
+with col2:
+    tz_now   = datetime.now(LOCAL_TZ).time()
+    start_t  = st.time_input("Start time", time(0,0))
+    end_t    = st.time_input("End time"  , time(23,59,59))
 
-def build_sched(profile, start, end):
-    rows, base = [], pd.Timestamp(start.floor("d"), tz=pytz.UTC)
-    while base < end:
-        for seg in profile.get("store", {}).get("basalprofile", []):
-            rows.append({"time": base + timedelta(minutes=int(seg["i"])),
-                         "rate": seg["rate"]})
-        base += pd.Timedelta("1d")
-    return pd.DataFrame(rows).query("time>=@start & time<=@end").sort_values("time")
-
-# ───────────────── UI ───────────────────────────────────────────────────────
-st.set_page_config("Adriana – Loop", layout="wide")
-st.markdown("### Adriana’s Looping Dashboard")
-
-c1, c2 = st.columns(2)
-with c1:
-    s_date = st.date_input("Start date", date.today())
-    s_time = st.time_input("Start time", time(0,0))
-with c2:
-    e_date = st.date_input("End date",   date.today())
-    e_time = st.time_input("End time",   time(23,59))
-
-start_dt = LOCAL_TZ.localize(datetime.combine(s_date, s_time)).astimezone(pytz.UTC)
-end_dt   = LOCAL_TZ.localize(datetime.combine(e_date, e_time)).astimezone(pytz.UTC)
+start_dt = LOCAL_TZ.localize(datetime.combine(sel_date, start_t)).astimezone(pytz.UTC)
+end_dt   = LOCAL_TZ.localize(datetime.combine(sel_date, end_t  )).astimezone(pytz.UTC)
 start_ms, end_ms = int(start_dt.timestamp()*1000), int(end_dt.timestamp()*1000)
 
-with st.spinner("Fetching Nightscout…"):
-    entries_df, treats_df, profile = fetch_ns(start_ms, end_ms)
+st.markdown("Fetching Nightscout …")
+entries_df, treats_df, profile = fetch_ns(start_ms, end_ms)
 
-bg_df   = entries_df
-bol_df  = treats_df.query("eventType=='Correction Bolus'").assign(units=lambda d: d["insulin"])
-smb_df  = treats_df.query("eventType=='Bolus'").assign(units=lambda d: d["insulin"])
-carb_df = treats_df.query("carbs.notnull() & carbs>0")
-temp_df = treats_df.query("eventType=='Temp Basal'")
-basal_sched_df = build_sched(profile, start_dt, end_dt)
+# ── DATAFRAMES ───────────────────────────────────────────────────────────────
+bg_df    = entries_df[["time","sgv"]].dropna()
 
-fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-                    row_heights=[0.45,0.27,0.28])
+bol_df   = treats_df.loc[treats_df["eventType"].isin(("Correction Bolus","Bolus"))].copy()
+bol_df["insulin"] = bol_df["insulin"].fillna(bol_df.get("amount",np.nan))
+bol_df   = bol_df.dropna(subset=["insulin"])
+bol_df["kind"]    = np.where(bol_df.get("enteredBy","").str.contains("smb",case=False),"SMB","Manual")
 
-# BG
-fig.add_trace(go.Scatter(x=bg_df["time"], y=bg_df["sgv"]/18,
-                         mode="lines+markers", name="BG",
-                         hovertemplate="%{y:.1f} mmol/L<br>%{x|%H:%M}"), 1,1)
+carb_df  = treats_df.loc[treats_df["carbs"].notnull() & (treats_df["carbs"]>0), ["time","carbs"]]
 
-# Bolus / SMB / Carbs
-if not bol_df.empty:
-    fig.add_trace(go.Bar(x=bol_df["time"], y=bol_df["units"], name="Manual bolus",
-                         marker_color="#1f77b4"), 2,1)
-if not smb_df.empty:
-    fig.add_trace(go.Bar(x=smb_df["time"], y=smb_df["units"], name="SMB",
-                         marker_color="#ff7f0e"), 2,1)
+temp_df  = treats_df.loc[treats_df["eventType"]=="Temp Basal"].copy()
+temp_df  = temp_df.assign(rate=lambda d:d["rate"].fillna(d["absolute"])).dropna(subset=["rate"]).sort_values("time")
+
+sched_df = build_sched(profile, start_dt, end_dt)
+
+# ── PLOTLY SUB-PLOTS ─────────────────────────────────────────────────────────
+fig = make_subplots(
+    rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+    row_heights=[0.4,0.3,0.3], specs=[[{}],[{}],[{}]]
+)
+
+# 1️⃣ BG line
+fig.add_trace(go.Scatter(
+    x=bg_df["time"], y=bg_df["sgv"]/18.0,   # mg/dl ➞ mmol/L
+    mode="lines+markers", line=dict(color="mediumseagreen"),
+    hovertemplate="%{y:.1f} mmol/L<br>%{x|%H:%M}", name="BG"
+), row=1,col=1)
+
+# 2️⃣ Bolus & Carbs
+for kind,color in [("Manual","royalblue"),("SMB","lightskyblue")]:
+    sub = bol_df.loc[bol_df["kind"]==kind]
+    if not sub.empty:
+        fig.add_trace(go.Bar(
+            x=sub["time"], y=sub["insulin"], name=kind,
+            marker_color=color, hovertemplate=f"{kind}: "+"%{y:.2f} U<br>%{x|%H:%M}"
+        ), row=2, col=1)
+
 if not carb_df.empty:
-    fig.add_trace(go.Scatter(x=carb_df["time"], y=[0.05]*len(carb_df),
-                             mode="markers+text",
-                             marker=dict(size=carb_df["carbs"], color="green", opacity=.7),
-                             text=[f"{c} g" for c in carb_df["carbs"]],
-                             textposition="top center", showlegend=False), 2,1)
+    fig.add_trace(go.Scatter(
+        x=carb_df["time"], y=[bol_df["insulin"].max()*1.05]*len(carb_df),
+        mode="markers+text",
+        marker=dict(size=np.clip(carb_df["carbs"],5,30), color="sandybrown", line=dict(width=1,color="black")),
+        text=carb_df["carbs"].astype(int),
+        textposition="top center",
+        name="Carbs",
+        hovertemplate="%{text} g<br>%{x|%H:%M}"
+    ), row=2, col=1)
 
-# Basal
-fig.add_trace(go.Scatter(x=basal_sched_df["time"], y=basal_sched_df["rate"],
-                         mode="lines", name="Scheduled basal",
-                         line=dict(color="grey", width=1, dash="dash")), 3,1)
+# 3️⃣ Basal
+# scheduled
+fig.add_trace(go.Scatter(
+    x=sched_df["time"], y=sched_df["rate"],
+    mode="lines", line=dict(color="lightgrey", width=1, dash="dash"),
+    name="Scheduled basal", hovertemplate="%{y:.2f} U/h<br>%{x|%H:%M}"
+), row=3,col=1)
+
+# temp basal as filled area
 if not temp_df.empty:
-    fig.add_trace(go.Scatter(x=temp_df["time"], y=temp_df["rate"],
-                             mode="lines", name="Temp basal", fill="tozeroy",
-                             line=dict(color="#9467bd")), 3,1)
+    fig.add_trace(go.Scatter(
+        x=temp_df["time"], y=temp_df["rate"],
+        mode="lines", line=dict(color="tomato"),
+        fill="tozeroy", fillcolor="rgba(255,99,71,0.3)",
+        name="Temp basal", hovertemplate="%{y:.2f} U/h<br>%{x|%H:%M}"
+    ), row=3,col=1)
 
-fig.update_yaxes(title="mmol/L", row=1,col=1)
-fig.update_yaxes(title="U / g",  row=2,col=1, rangemode="tozero")
-fig.update_yaxes(title="U/h",    row=3,col=1, rangemode="tozero")
-fig.update_layout(height=740, bargap=.2, legend_orientation="h",
-                  hovermode="x unified", template="simple_white",
-                  margin=dict(t=48,b=20,l=40,r=40))
+# ── LAYOUT ───────────────────────────────────────────────────────────────────
+max_bolus = bol_df["insulin"].max() if not bol_df.empty else 1
+fig.update_yaxes(title_text="mmol/L", row=1,col=1)
+fig.update_yaxes(title_text="Insulin U", range=[0,max_bolus*1.3], row=2,col=1)
+fig.update_yaxes(title_text="Basal U/h", row=3,col=1)
+fig.update_layout(
+    height=800, bargap=0.15, legend=dict(orientation="h",y=1.02,x=0),
+    hovermode="x unified", template="plotly_white"
+)
 
 st.plotly_chart(fig, use_container_width=True)
