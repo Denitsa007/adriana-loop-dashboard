@@ -28,6 +28,9 @@ st.success("Data loaded.")
 entries_df['time'] = pd.to_datetime(entries_df['dateString'], errors='coerce')
 entries_df['mmol'] = entries_df['sgv'] / 18.0  # Convert mg/dL to mmol/L
 
+# Print dtype for debugging purposes
+st.write("Entries time column dtype: ", entries_df['time'].dtype)
+
 # Remove any rows with invalid times
 entries_df = entries_df.dropna(subset=['time'])
 
@@ -51,6 +54,14 @@ with col2:
 # Combine into datetime and ensure proper type
 start_time = pd.to_datetime(datetime.combine(start_date, start_hour))
 end_time = pd.to_datetime(datetime.combine(end_date, end_hour))
+
+# Print comparison for debugging purposes
+st.write("Start time:", start_time)
+st.write("End time:", end_time)
+
+# Ensure both start_time/end_time are datetime64[ns] for comparison
+start_time = pd.to_datetime(start_time)
+end_time = pd.to_datetime(end_time)
 
 # Filter all data
 entries_df = entries_df[
