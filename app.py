@@ -36,7 +36,7 @@ def fetch_nightscout_data() -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
     Returns: (entries_df, treatments_df, profile_dict)
     """
     headers = {"API-SECRET": NS_SECRET}
-    since = int((datetime.utcnow() - timedelta(days=DAYS_BACK)).timestamp() * 1000
+    since = int((datetime.utcnow() - timedelta(days=DAYS_BACK)).timestamp() * 1000)
     
     endpoints = {
         "entries": f"{NS_URL}/api/v1/entries.json?find[date][$gte]={since}&count=8640",
