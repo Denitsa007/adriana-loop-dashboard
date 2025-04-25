@@ -1,163 +1,161 @@
-# ── Adriana's Looping Dashboard (MVP) ───────────────────────────────
-import os, json, pytz
-from datetime import datetime, timedelta
-
-import streamlit as st
+import os, time, pytz, requests, streamlit as st
 import pandas as pd
-import requests
-from plotly.subplots import make_subplots
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime, date, time as dtime, timedelta
 
-# -------------------------------------------------------------------
-st.set_page_config(page_title="Adriana Loop Dashboard", layout="wide")
-st.title("Adriana's Looping Dashboard (MVP)")
+# ──────────────────────────────  SETTINGS  ──────────────────────────────
+NS_URL     = st.secrets["NIGHTSCOUT_URL"].rstrip("/")
+NS_SECRET  = st.secrets["API_SECRET"]
+DAYS_BACK  = 30                 # how many days of data to download
+READ_TO    = 30                 # seconds for one HTTP read
+MAX_RETRY  = 2                  # Nightscout retries on timeout
+LOCAL_TZ   = pytz.timezone(time.tzname[0])
 
-NS_URL    = st.secrets["NIGHTSCOUT_URL"].rstrip("/")
-NS_SECRET = st.secrets["API_SECRET"]
-DAYS_BACK = 90               # how far to fetch
-
-# -------------------------------------------------------------------
+# ────────────────────────  NIGHTSCOUT DOWNLOAD  ────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_ns():
-    """Download entries, treatments and profile once every 10 min."""
-    hdr  = {"API-SECRET": NS_SECRET}
+def fetch_ns(max_retry=MAX_RETRY, read_to=READ_TO):
+    hdr = {"API-SECRET": NS_SECRET}
     since = int((datetime.utcnow() - timedelta(days=DAYS_BACK)).timestamp()*1000)
-    to    = 8640                      # 5-min points for 30 days
 
-    e_url = f"{NS_URL}/api/v1/entries.json?find[date][$gte]={since}&count={to}"
-    t_url = f"{NS_URL}/api/v1/treatments.json?find[created_at][$gte]={since}&count=4000"
+    urls = dict(
+        entries = f"{NS_URL}/api/v1/entries.json"
+                  f"?find[date][$gte]={since}&count=8640",
+        treats  = f"{NS_URL}/api/v1/treatments.json"
+                  f"?find[created_at][$gte]={since}&count=4000",
+        profile = f"{NS_URL}/api/v1/profile.json"
+    )
 
-    timeout = (10, 15)
-    entries    = requests.get(e_url, headers=hdr, timeout=timeout).json()
-    treatments = requests.get(t_url, headers=hdr, timeout=timeout).json()
-    prof_raw   = requests.get(f"{NS_URL}/api/v1/profile.json", headers=hdr,
-                              timeout=timeout).json()
+    for attempt in range(max_retry + 1):
+        try:
+            to = (10, read_to)
+            entries  = requests.get(urls['entries'], headers=hdr, timeout=to).json()
+            treats   = requests.get(urls['treats'],  headers=hdr, timeout=to).json()
+            profile  = requests.get(urls['profile'], headers=hdr, timeout=to).json()
+            break
+        except requests.exceptions.ReadTimeout:
+            if attempt == max_retry:
+                raise
+            st.warning(f"Nightscout slow – retry {attempt+1}/{max_retry}…")
+            time.sleep(1)
 
     edf = pd.DataFrame(entries)
-    tdf = pd.DataFrame(treatments)
-
+    tdf = pd.DataFrame(treats)
+    prof = profile[0] if profile else {}
     if not edf.empty:
         edf["time"] = pd.to_datetime(edf["date"], unit="ms", utc=True)
     if not tdf.empty:
         tdf["time"] = pd.to_datetime(tdf["created_at"], utc=True)
+    return edf, tdf, prof
 
-    profile = prof_raw[0] if prof_raw else {}
-    return edf, tdf, profile
+# ─────────────  BASAL SCHEDULE (from profile -> step dataframe)  ─────────
+def build_sched(profile, start_utc, end_utc):
+    if not profile:                     # guard – profile may be empty
+        return pd.DataFrame()
+    base = pd.to_datetime(profile["startDate"], utc=True)
+    rows = []
+    for seg in profile['store']['basalprofile']:
+        seg_time = base + timedelta(minutes=int(seg['i']))
+        rows.append(dict(time=seg_time, rate=float(seg['v'])))
+    df = pd.DataFrame(rows).sort_values("time")
+    # extend one extra row to cover last segment
+    df = pd.concat([df, df.tail(1).assign(time=end_utc + timedelta(hours=1))])
+    df = df[(df['time'] >= start_utc) & (df['time'] <= end_utc)]
+    return df.reset_index(drop=True)
 
-# -------------------------------------------------------------------
-st.info("Fetching data from Nightscout …")
-try:
-    entries_df, t_df, profile = fetch_ns()
-    st.success("Nightscout data loaded")
-except Exception as e:
-    st.error(f"Nightscout error ➜ {e}")
-    st.stop()
+# ──────────────────────────────  UI  ────────────────────────────────────
+st.set_page_config("Adriana Loop Dashboard", layout="wide")
+st.title("Adriana's Looping Dashboard (MVP)")
 
-# ── date-time pickers ───────────────────────────────────────────────
-local_tz   = datetime.now().astimezone().tzinfo        # zoneinfo tz
-today_date = datetime.now(local_tz).date()
+today = date.today()
+col1, col2, col3, col4 = st.columns(4)
+with col1: sd = st.date_input("Start date",  today)
+with col2: st_time = st.time_input("Start time", dtime(0,0))
+with col3: ed = st.date_input("End date",    today)
+with col4: et_time = st.time_input("End time",   dtime(23,59))
 
-col1, col2 = st.columns(2)
-with col1:
-    start_date = st.date_input("Start date",  today_date)
-    start_time = st.time_input("Start time",  datetime.strptime("00:00","%H:%M").time())
-with col2:
-    end_date   = st.date_input("End date",    today_date)
-    end_time   = st.time_input("End time",    datetime.strptime("23:59","%H:%M").time())
+start_dt = LOCAL_TZ.localize(datetime.combine(sd, st_time)).astimezone(pytz.UTC)
+end_dt   = LOCAL_TZ.localize(datetime.combine(ed, et_time)).astimezone(pytz.UTC)
 
-start_dt = datetime.combine(start_date, start_time, tzinfo=local_tz).astimezone(pytz.UTC)
-end_dt   = datetime.combine(end_date,   end_time,   tzinfo=local_tz).astimezone(pytz.UTC)
+st.write("Fetching data from Nightscout…")
+entries_df, treats_df, profile = fetch_ns()
+st.success("Data loaded.")
 
-if end_dt < start_dt:
-    st.error("End must be after start")
-    st.stop()
+# ────────────────────────  FILTER BY DATE  ─────────────────────────────
+entries_df = entries_df[(entries_df['time'] >= start_dt) & (entries_df['time'] <= end_dt)]
+treats_df  = treats_df[(treats_df['time']  >= start_dt) & (treats_df['time']  <= end_dt)]
 
-# ── slice Nightscout data to interval ───────────────────────────────
-mask_e = (entries_df["time"] >= start_dt) & (entries_df["time"] <= end_dt)
-entries_df = entries_df.loc[mask_e].copy()
+# ─────────────────────────  PREPARE DATA  ──────────────────────────────
+entries_df['mmol'] = (entries_df['sgv'] / 18).round(1)  # mg/dL → mmol/L
 
-mask_t = (t_df["time"] >= start_dt) & (t_df["time"] <= end_dt)
-t_df = t_df.loc[mask_t].copy()
+bolus_df = treats_df[treats_df['insulin'].notnull()]
+smb_df   = bolus_df[bolus_df['enteredBy'].str.contains('SMB', na=False)]
+man_df   = bolus_df[~bolus_df['enteredBy'].str.contains('SMB', na=False)]
 
-entries_df["mmol"] = (entries_df["sgv"] / 18).round(1)
+carb_df  = treats_df[treats_df['carbs'].fillna(0) > 0]
 
-bolus_df = t_df[t_df["insulin"].notna()]
-smb_df   = bolus_df[bolus_df["enteredBy"].str.contains("SMB", na=False)]
-man_df   = bolus_df[~bolus_df["enteredBy"].str.contains("SMB", na=False)]
+basal_sched_df = build_sched(profile, start_dt, end_dt)
 
-carb_df  = t_df[t_df["carbs"].notna() & (t_df["carbs"] > 0)]
+# ────────────────────────────  PLOTTING  ───────────────────────────────
+fig = make_subplots(
+    rows=3, cols=1, shared_xaxes=True,
+    row_heights=[0.5, 0.25, 0.25],
+    vertical_spacing=0.02,
+    specs=[[{}],[{}],[{}]]
+)
 
-# ── scheduled basal helper ─────────────────────────────────────────
-def build_sched(prof_dict, start_utc, end_utc):
-    if not prof_dict:
-        return pd.DataFrame(columns=["time","rate"])
-    try:
-        basal_blocks = prof_dict["store"]["basalprofile"]
-    except KeyError:
-        return pd.DataFrame(columns=["time","rate"])
+# BG line
+fig.add_trace(go.Scatter(
+    x=entries_df['time'], y=entries_df['mmol'],
+    mode='lines', line=dict(color='green'),
+    name='BG (mmol/L)', hovertemplate="%{y:.1f} mmol/L<br>%{x|%H:%M}"
+), row=1, col=1)
 
-    base = start_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    rows = [(base + timedelta(minutes=int(b["i"])), b["value"]) for b in basal_blocks]
-    sched = pd.DataFrame(rows, columns=["time","rate"])
-    while sched["time"].max() < end_utc:
-        sched = pd.concat([sched, sched.assign(time=sched["time"] + timedelta(days=1))])
-    return sched[(sched["time"]>=start_utc)&(sched["time"]<=end_utc)]
+# Carb dots
+fig.add_trace(go.Scatter(
+    x=carb_df['time'], y=[15]*len(carb_df),
+    mode='markers+text', marker=dict(color='orange', size=8),
+    text=carb_df['carbs'].astype(int).astype(str)+' g',
+    textposition="top center",
+    name='Carbs'
+), row=2, col=1)
 
-sched_df = build_sched(profile, start_dt, end_dt)
+# Manual bolus bars
+fig.add_trace(go.Bar(
+    x=man_df['time'], y=man_df['insulin'],
+    marker_color='rgba(0,102,204,0.6)', name='Manual bolus'
+), row=2, col=1)
 
-# ── plotly figure with three panels ────────────────────────────────
-fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                    row_heights=[0.45, 0.30, 0.25], vertical_spacing=0.03,
-                    subplot_titles=("Blood Glucose",
-                                    "Bolus / SMB + Carbs",
-                                    "Scheduled Basal (U/h)"))
+# SMB bars
+fig.add_trace(go.Bar(
+    x=smb_df['time'], y=smb_df['insulin'],
+    marker_color='rgba(255,99,132,0.6)', name='SMB'
+), row=2, col=1)
 
-fig.add_trace(go.Scatter(x=entries_df["time"], y=entries_df["mmol"],
-                         mode="lines+markers", name="BG",
-                         line=dict(color="green"), marker=dict(size=4),
-                         hovertemplate="%{y:.1f} mmol/L<br>%{x|%Y-%m-%d %H:%M}"),
-              row=1, col=1)
+# Scheduled basal (step)
+if not basal_sched_df.empty:
+    fig.add_trace(go.Scatter(
+        x=basal_sched_df['time'], y=basal_sched_df['rate'],
+        mode='lines', line_shape='hv',
+        line=dict(color='black'), name='Scheduled basal'
+    ), row=3, col=1)
 
-fig.add_trace(go.Bar(x=man_df["time"], y=man_df["insulin"],
-                     name="Manual bolus", marker_color="rgba(0,102,204,.6)"),
-              row=2, col=1)
-fig.add_trace(go.Bar(x=smb_df["time"], y=smb_df["insulin"],
-                     name="SMB", marker_color="rgba(255,99,132,.6)"),
-              row=2, col=1)
+# Temp basal (from treatments)
+temp_df = treats_df[treats_df['eventType'] == "Temp Basal"]
+if not temp_df.empty:
+    fig.add_trace(go.Bar(
+        x=temp_df['time'], y=temp_df['rate'].fillna(0),
+        marker_color='rgba(200,200,200,0.6)', name='Temp basal'
+    ), row=3, col=1)
 
-fig.add_trace(go.Scatter(x=carb_df["time"], y=[0]*len(carb_df),
-                         text=[f"{c} g" for c in carb_df["carbs"]],
-                         mode="markers+text", textposition="top center",
-                         marker=dict(symbol="circle", size=10, color="orange"),
-                         name="Carbs"),
-              row=2, col=1)
+# Layout tweaks
+fig.update_yaxes(title_text="mmol/L", row=1, col=1, range=[2,15])
+fig.update_yaxes(title_text="U / g carbs", row=2, col=1)
+fig.update_yaxes(title_text="Basal U/h", row=3, col=1)
 
-fig.add_trace(go.Scatter(x=sched_df["time"], y=sched_df["rate"],
-                         mode="lines", step="post",
-                         line=dict(color="darkorange"),
-                         name="Scheduled basal"),
-              row=3, col=1)
-
-fig.update_yaxes(title_text="mmol/L", row=1, col=1, range=[2, 15])
-fig.update_yaxes(title_text="U",      row=2, col=1)
-fig.update_yaxes(title_text="U/h",    row=3, col=1)
-
-fig.update_layout(height=800, bargap=0.15,
-                  legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                              xanchor="right", x=1),
-                  margin=dict(t=40, b=40, l=50, r=30), hovermode="closest")
+fig.update_layout(
+    height=800, bargap=0.15, legend_orientation="h",
+    margin=dict(t=40, r=20, b=40, l=60)
+)
 
 st.plotly_chart(fig, use_container_width=True)
-
-# ── optional TDD notification ─────────────────────────────────────
-try:
-    bolus_df["date"] = bolus_df["time"].dt.date
-    tdd = bolus_df.groupby("date")["insulin"].sum()
-    last7, prev7 = tdd[-7:].mean(), tdd[-14:-7].mean()
-    delta = last7 - prev7
-    if abs(delta) > 2:
-        txt = "higher 📈" if delta > 0 else "lower 📉"
-        st.info(f"Average TDD last week is **{abs(delta):.1f} U {txt}** "
-                f"({last7:.1f} U vs {prev7:.1f} U).")
-except Exception:
-    pass
