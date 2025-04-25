@@ -8,7 +8,7 @@ from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-NS_URL      = st.secrets.get("NS_URL"     , "").rstrip("/")
+NS_URL      = st.secrets.get("NIGHTSCOUT_URL"     , "").rstrip("/")
 API_SECRET  = st.secrets.get("API_SECRET", "")
 HEADERS     = {"api-secret": API_SECRET} if API_SECRET else {}
 LOCAL_TZ    = pytz.timezone(str(st.secrets.get("LOCAL_TZ","UTC")))  # e.g. "Europe/Berlin"
