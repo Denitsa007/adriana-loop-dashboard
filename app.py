@@ -1,6 +1,8 @@
 import streamlit as st
 import requests
 import pandas as pd
+import plotly.graph_objects as go
+from datetime import datetime
 
 st.set_page_config(page_title="Adriana Loop Dashboard", layout="wide")
 st.title("Adriana's Looping Dashboard — Now with Timeline!")
@@ -20,22 +22,24 @@ def fetch_nightscout_data():
 
 st.write("Fetching data from Nightscout...")
 entries_df, treatments_df, devicestatus_df = fetch_nightscout_data()
-
 st.success("Data loaded.")
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
 
-# Convert Nightscout BG entries to DataFrame
+# Format timestamps and BG values
 entries_df['time'] = pd.to_datetime(entries_df['dateString'])
-entries_df['mmol'] = entries_df['sgv'] / 18.0  # Convert mg/dL → mmol/L
+entries_df['mmol'] = entries_df['sgv'] / 18.0  # Convert mg/dL to mmol/L
 
-# Convert treatments to DataFrame and filter boluses and SMBs
 treatments_df['time'] = pd.to_datetime(treatments_df['created_at'])
 bolus_df = treatments_df[treatments_df['insulin'].notnull()]
-smb_df = bolus_df[bolus_df['enteredBy'].str.contains('SMB', na=False)]
-manual_bolus_df = bolus_df[~bolus_df['enteredBy'].str.contains('SMB', na=False)]
 
-# Plotting
+# Time filter UI
+start_time = st.datetime_input("Start time", value=entries_df['time'].min())
+end_time = st.datetime_input("End time", value=entries_df['time'].max())
+
+# Filter all data
+entries_df = entries_df[(entries_df['time'] >= start_time) & (entries_df['time'] <= end_time)]
+bolus_df = bolus_df[(bolus_df['time'] >= start_time) & (bolus_df['time'] <= end_time)]
+
+# Plot
 fig = go.Figure()
 
 # BG Line
@@ -47,22 +51,13 @@ fig.add_trace(go.Scatter(
     line=dict(color='green')
 ))
 
-# Manual Bolus Bars
+# Bolus Bars (manual + SMB combined for now)
 fig.add_trace(go.Bar(
-    x=manual_bolus_df['time'],
-    y=manual_bolus_df['insulin'],
-    name='Manual Bolus (U)',
+    x=bolus_df['time'],
+    y=bolus_df['insulin'],
+    name='Bolus (U)',
     yaxis='y2',
-    marker_color='rgba(0, 102, 204, 0.6)'
-))
-
-# SMB Bars
-fig.add_trace(go.Bar(
-    x=smb_df['time'],
-    y=smb_df['insulin'],
-    name='SMB (U)',
-    yaxis='y2',
-    marker_color='rgba(255, 99, 132, 0.6)'
+    marker_color='rgba(0, 102, 204, 0.4)'
 ))
 
 # Layout
