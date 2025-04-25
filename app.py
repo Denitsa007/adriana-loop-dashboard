@@ -1,19 +1,18 @@
-# ─────────────────────────────────────────────────────────────────────────────
-#  Adriana Loop Dashboard – full code (BG + bolus / SMB + carbs + basal)
-# ─────────────────────────────────────────────────────────────────────────────
-import streamlit as st
-import requests, pandas as pd
+# ─────────────────────────────────────────────────────────────────────
+#  Adriana Loop Dashboard – BG + bolus / SMB + carbs + temp-basal
+# ─────────────────────────────────────────────────────────────────────
+import streamlit as st, requests, pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, time, timezone
 
-# ▼──────────────────────── Page / credentials ────────────────────────▼
+# ── Page + Nightscout creds ──────────────────────────────────────────
 st.set_page_config(page_title="Adriana Loop Dashboard", layout="wide")
 st.title("Adriana's Looping Dashboard (MVP)")
 
 NS_URL    = st.secrets["NIGHTSCOUT_URL"]
 NS_SECRET = st.secrets["API_SECRET"]
 
-# ▼──────────────────────── Date-time pickers ─────────────────────────▼
+# ── Date-time pickers ────────────────────────────────────────────────
 today = datetime.now(timezone.utc).date()
 c1, c2 = st.columns(2)
 with c1:
@@ -26,7 +25,7 @@ with c2:
 start_dt = datetime.combine(start_date, start_time, tzinfo=timezone.utc)
 end_dt   = datetime.combine(end_date,   end_time,   tzinfo=timezone.utc)
 
-# ▼──────────────────────── Fetch Nightscout ──────────────────────────▼
+# ── Nightscout fetch (cached 10 min) ─────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_ns():
     hdr = {"API-SECRET": NS_SECRET}
@@ -40,13 +39,13 @@ st.write("Fetching data from Nightscout…")
 entries_df, t_df = fetch_ns()
 st.success("Data loaded")
 
-# ▼──────────────────────── Pre-processing ────────────────────────────▼
+# ── Pre-processing ──────────────────────────────────────────────────
 entries_df['time'] = pd.to_datetime(entries_df['dateString'], utc=True)
 entries_df['mmol'] = (entries_df['sgv'] / 18).round(1)
 
 t_df['time'] = pd.to_datetime(t_df['created_at'], utc=True)
 
-# (1) Identify SMB vs manual bolus
+#  SMB vs Manual bolus
 t_df['isSMB'] = False
 if 'isSMB' in t_df.columns:
     t_df.loc[t_df['isSMB'] == True, 'isSMB'] = True
@@ -57,17 +56,13 @@ bolus_df   = t_df[t_df['insulin'].notnull()]
 smb_df     = bolus_df[ bolus_df['isSMB']]
 manual_df  = bolus_df[~bolus_df['isSMB']]
 
-# (2) Carbs
-carb_df = t_df[t_df['carbs'].fillna(0) > 0]
-
-# (3) Temp-basal (rate in U/h)
-basal_df = t_df[t_df['eventType'] == 'Temp Basal']
+carb_df   = t_df[t_df['carbs'].fillna(0) > 0]             # carbs
+basal_df  = t_df[t_df['eventType'] == 'Temp Basal']       # temp-basal
 if 'rate' in basal_df.columns:
     basal_df['rate'] = basal_df['rate'].astype(float)
 
-# ▼──────────────────────── Window filter ─────────────────────────────▼
-def wnd(df):  # helper
-    return df[(df['time'] >= start_dt) & (df['time'] <= end_dt)]
+# ── Window filter helper ────────────────────────────────────────────
+def wnd(df): return df[(df['time'] >= start_dt) & (df['time'] <= end_dt)]
 
 entries_df = wnd(entries_df)
 manual_df  = wnd(manual_df)
@@ -75,14 +70,13 @@ smb_df     = wnd(smb_df)
 carb_df    = wnd(carb_df)
 basal_df   = wnd(basal_df)
 
-# ▼──────────────────────── Plotly chart ──────────────────────────────▼
+# ── Plotly figure ───────────────────────────────────────────────────
 fig = go.Figure()
 
-# BG line
+# BG
 fig.add_trace(go.Scatter(
     x=entries_df['time'], y=entries_df['mmol'],
-    mode='lines+markers', name='BG (mmol/L)',
-    line=dict(color='green'),
+    mode='lines+markers', name='BG (mmol/L)', line=dict(color='green'),
     hovertemplate='%{y:.1f} mmol/L<br>%{x|%Y-%m-%d %H:%M}<extra></extra>'
 ))
 
@@ -110,7 +104,7 @@ fig.add_trace(go.Bar(
     hovertemplate='%{y} g carbs<br>%{x|%Y-%m-%d %H:%M}<extra></extra>'
 ))
 
-# Temp-basal (step line)
+# Temp-basal
 if not basal_df.empty:
     fig.add_trace(go.Scatter(
         x=basal_df['time'], y=basal_df['rate'],
@@ -119,21 +113,28 @@ if not basal_df.empty:
         hovertemplate='%{y} U/h<br>%{x|%Y-%m-%d %H:%M}<extra></extra>'
     ))
 
-# Layout with multiple y-axes
+# ── Layout with 4 y-axes (anchor='free' fixes the error) ─────────────
 fig.update_layout(
     title='BG + Insulin + Carbs + Basal',
     xaxis=dict(title='Time'),
     yaxis=dict(title='BG (mmol/L)', range=[2, 15]),
-    yaxis2=dict(title='Bolus U', overlaying='y', side='right', showgrid=False),
-    yaxis3=dict(title='Carbs g', overlaying='y', side='left',
-                position=0.05, showgrid=False, tickfont=dict(color='darkorange'),
+    yaxis2=dict(title='Bolus U',
+                overlaying='y', side='right', showgrid=False),
+    yaxis3=dict(title='Carbs g',
+                overlaying='y', side='left',
+                anchor='free', position=0.05,
+                showgrid=False,
+                tickfont=dict(color='darkorange'),
                 titlefont=dict(color='darkorange')),
-    yaxis4=dict(title='Basal U/h', overlaying='y', side='right',
-                position=0.95, showgrid=False, tickfont=dict(color='purple'),
+    yaxis4=dict(title='Basal U/h',
+                overlaying='y', side='right',
+                anchor='free', position=0.95,
+                showgrid=False,
+                tickfont=dict(color='purple'),
                 titlefont=dict(color='purple')),
     bargap=0.15, height=600,
     legend=dict(orientation='h')
 )
 
 st.plotly_chart(fig, use_container_width=True)
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────
